@@ -13,18 +13,21 @@ st.set_page_config(page_title="Geotech GPS Stamper", page_icon="📍", layout="w
 
 # --- SIDEBAR CALIBRATION ---
 st.sidebar.header("⚙️ OCR Calibration")
-left_p = st.sidebar.slider("Left %", 0, 100, 50) # Adjusted left to capture full string
-top_p = st.sidebar.slider("Top %", 0, 100, 90)
+left_p = st.sidebar.slider("Left %", 0, 100, 50)
+top_p = st.sidebar.slider("Top %", 0, 100, 92) # Default lower to avoid the date
 right_p = st.sidebar.slider("Right %", 0, 100, 98)
 bot_p = st.sidebar.slider("Bottom %", 0, 100, 98)
 thresh_val = st.sidebar.slider("B&W Threshold", 0, 255, 140)
 invert_img = st.sidebar.checkbox("Invert Colors", value=True)
 
 def dms_to_decimal(degrees, minutes, seconds, direction):
-    decimal = float(degrees) + float(minutes)/60 + float(seconds)/3600
-    if direction in ['S', 'W']:
-        decimal = -decimal
-    return decimal
+    try:
+        decimal = float(degrees) + float(minutes)/60 + float(seconds)/3600
+        if direction in ['S', 'W']:
+            decimal = -decimal
+        return decimal
+    except:
+        return None
 
 st.title("📍 Geotechnical GPS Stamper")
 
@@ -53,15 +56,19 @@ if uploaded_files:
                 draw_img = img.copy()
                 ImageDraw.Draw(draw_img).rectangle(crop_area, outline="red", width=15)
                 c1.image(draw_img)
-                c2.image(crop, caption="OCR Target")
+                c2.image(crop, caption="OCR Target (Ensure date/heading are NOT in the box)")
 
-            # OCR - Allowing symbols for Degrees/Minutes/Seconds
+            # OCR Extraction
             raw_text = pytesseract.image_to_string(crop, config='--oem 3 --psm 6')
-            st.write(f"Raw OCR Output: `{raw_text.strip()}`") # Show user what is being read
-
-            # Regex to find: Degrees, Minutes, Seconds, Direction
-            # Pattern: (Deg)°(Min)'(Sec)"(Dir)
-            parts = re.findall(r"(\d+)[^\d]+(\d+)[^\d]+(\d+\.?\d*)[^\d]+([NSEW])", raw_text)
+            
+            # CLEANUP: Degree symbols and quotes often read as 'S', '8', or 'B'
+            # We strip them to let the Regex find the digits.
+            clean_text = raw_text.replace('°', ' ').replace("'", ' ').replace('"', ' ')
+            
+            # REGEX: Specifically looks for Deg, Min, Sec followed by N, S, E, or W
+            # This ignores the heading (272 W) because it lacks the full DMS structure
+            pattern = r"(\d+)\s+(\d+)\s+(\d+\.?\d*)\s*([NSEW])"
+            parts = re.findall(pattern, clean_text)
 
             img.close()
 
@@ -69,15 +76,24 @@ if uploaded_files:
                 lat = dms_to_decimal(parts[0][0], parts[0][1], parts[0][2], parts[0][3])
                 lon = dms_to_decimal(parts[1][0], parts[1][1], parts[1][2], parts[1][3])
                 
-                # Injection
-                cmd = ['exiftool', f'-GPSLatitude={lat}', f'-GPSLongitude={lon}', '-overwrite_original', temp_path]
-                subprocess.run(cmd, capture_output=True)
-                
-                map_data.append({"lat": lat, "lon": lon, "name": uploaded_file.name})
-                processed_files.append((uploaded_file.name, open(temp_path, "rb").read()))
-                log_entries.append(f"✅ {uploaded_file.name}: {lat}, {lon}")
+                # --- FLORIDA SAFETY FIX ---
+                # If OCR read 'S' instead of 'N', flip it back.
+                if lat < 0 and parts[0][3].upper() in ['N', 'S']:
+                    lat = abs(lat)
+
+                if lat and lon:
+                    # Injection via ExifTool
+                    cmd = ['exiftool', f'-GPSLatitude={lat}', f'-GPSLongitude={lon}', 
+                           '-GPSLatitudeRef=N', '-GPSLongitudeRef=W', '-overwrite_original', temp_path]
+                    subprocess.run(cmd, capture_output=True)
+                    
+                    map_data.append({"lat": lat, "lon": lon, "name": uploaded_file.name})
+                    processed_files.append((uploaded_file.name, open(temp_path, "rb").read()))
+                    log_entries.append(f"✅ {uploaded_file.name}: {lat}, {lon}")
+                else:
+                    log_entries.append(f"❌ {uploaded_file.name}: Math error on coordinates.")
             else:
-                log_entries.append(f"❌ {uploaded_file.name}: Format not recognized.")
+                log_entries.append(f"❌ {uploaded_file.name}: Could not find two sets of DMS coordinates. OCR saw: {raw_text}")
 
         except Exception as e:
             log_entries.append(f"⚠️ Error: {str(e)}")
@@ -90,12 +106,12 @@ if uploaded_files:
         with col1:
             st.map(pd.DataFrame(map_data))
         with col2:
+            st.subheader("Results")
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zf:
-                for fn, data in processed_files: zf.writestr(f"GPS_{fn}", data)
+                for fn, data in processed_files: zf.writestr(f"STAMPED_{fn}", data)
             st.download_button("📥 DOWNLOAD ALL (ZIP)", zip_buffer.getvalue(), "stamped_photos.zip", use_container_width=True)
             st.dataframe(pd.DataFrame(map_data), hide_index=True)
-    else:
-        st.warning("No coordinates were successfully parsed. Adjust the 'Left %' slider to ensure the full string is in the red box.")
 
-    st.text_area("Logs", value="\n".join(log_entries))
+    st.subheader("Status Log")
+    st.text_area("Log Output", value="\n".join(log_entries), height=200)
