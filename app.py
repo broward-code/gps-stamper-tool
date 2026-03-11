@@ -1,117 +1,104 @@
-import streamlit as st
-import pytesseract
-from PIL import Image, ImageOps, ImageDraw
-import subprocess
 import os
 import re
 import zipfile
 import io
-import pandas as pd
-from datetime import datetime
+from PIL import Image
+import pytesseract
+import piexif
 
-st.set_page_config(page_title="Geotech GPS Stamper", page_icon="📍", layout="wide")
+# --- CONFIGURATION ---
+EXCEL_FILE = 'field_data.xlsx'
+OUTPUT_FOLDER = 'processed_geotech_photos'
+# Ensure Tesseract is in your PATH or specify here:
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# --- SIDEBAR CALIBRATION ---
-st.sidebar.header("⚙️ OCR Calibration")
-left_p = st.sidebar.slider("Left %", 0, 100, 50)
-top_p = st.sidebar.slider("Top %", 0, 100, 92) # Default lower to avoid the date
-right_p = st.sidebar.slider("Right %", 0, 100, 98)
-bot_p = st.sidebar.slider("Bottom %", 0, 100, 98)
-thresh_val = st.sidebar.slider("B&W Threshold", 0, 255, 140)
-invert_img = st.sidebar.checkbox("Invert Colors", value=True)
+def dd_to_exif_rational(dd):
+    """Converts decimal degrees to EXIF-compatible rational format."""
+    dd = abs(dd)
+    degrees = int(dd)
+    minutes_full = (dd - degrees) * 60
+    minutes = int(minutes_full)
+    seconds = int(round((minutes_full - minutes) * 60 * 100, 0))
+    return ((degrees, 1), (minutes, 1), (seconds, 100))
 
-def dms_to_decimal(degrees, minutes, seconds, direction):
-    try:
-        decimal = float(degrees) + float(minutes)/60 + float(seconds)/3600
-        if direction in ['S', 'W']:
-            decimal = -decimal
-        return decimal
-    except:
-        return None
-
-st.title("📍 Geotechnical GPS Stamper")
-
-uploaded_files = st.file_uploader("Upload Photos", type=['jpg', 'jpeg'], accept_multiple_files=True)
-
-if uploaded_files:
-    map_data, processed_files, log_entries = [], [], []
+def parse_coordinates(text):
+    """
+    Detects and converts both DD and DMS formats from OCR text.
+    Handles: N26.081078 W80.169002 OR 26°4'51"N 80°10'8"W
+    """
+    # Clean up common OCR noise
+    text = text.replace('\n', ' ').strip()
     
-    for i, uploaded_file in enumerate(uploaded_files):
-        temp_path = f"temp_{i}_{uploaded_file.name}"
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+    # Pattern 1: Decimal Degrees (DD) - e.g., N26.081078 W80.169002
+    dd_pattern = r'([NS])\s?(\d+\.\d+)\s+([EW])\s?(\d+\.\d+)'
+    
+    # Pattern 2: Degrees Minutes Seconds (DMS) - e.g., 26°4\'51"N
+    dms_pattern = r'(\d+)[°\s](\d+)[\'\s](\d+\.?\d*)[\"\s]([NS])\s+(\d+)[°\s](\d+)[\'\s](\d+\.?\d*)[\"\s]([EW])'
+
+    # Try DD first (The recent failure case)
+    dd_match = re.search(dd_pattern, text)
+    if dd_match:
+        lat_ref, lat_val, lon_ref, lon_val = dd_match.groups()
+        return float(lat_val), lat_ref, float(lon_val), lon_ref
+
+    # Try DMS
+    dms_match = re.search(dms_pattern, text)
+    if dms_match:
+        la_d, la_m, la_s, la_ref, lo_d, lo_m, lo_s, lo_ref = dms_match.groups()
+        lat_dd = int(la_d) + int(la_m)/60 + float(la_s)/3600
+        lon_dd = int(lo_d) + int(lo_m)/60 + float(lo_s)/3600
+        return lat_dd, la_ref, lon_dd, lo_ref
+
+    return None
+
+def process_photos(excel_path):
+    if not os.path.exists(OUTPUT_FOLDER):
+        os.makedirs(OUTPUT_FOLDER)
+
+    with zipfile.ZipFile(excel_path, 'r') as archive:
+        image_files = [f for f in archive.namelist() if f.startswith('xl/media/')]
         
-        try:
-            img = ImageOps.exif_transpose(Image.open(temp_path))
-            w, h = img.size
-            crop_area = (w*(left_p/100), h*(top_p/100), w*(right_p/100), h*(bot_p/100))
+        for img_name in image_files:
+            img_data = archive.read(img_name)
+            local_name = os.path.basename(img_name)
+            local_path = os.path.join(OUTPUT_FOLDER, local_name)
             
-            crop = img.crop(crop_area).convert('L')
-            if invert_img: crop = ImageOps.invert(crop)
-            crop = crop.point(lambda x: 0 if x < thresh_val else 255) 
+            with open(local_path, 'wb') as f:
+                f.write(img_data)
 
-            if i == 0:
-                st.subheader("🔍 Calibration Preview")
-                c1, c2 = st.columns([2, 1])
-                draw_img = img.copy()
-                ImageDraw.Draw(draw_img).rectangle(crop_area, outline="red", width=15)
-                c1.image(draw_img)
-                c2.image(crop, caption="OCR Target (Ensure date/heading are NOT in the box)")
-
-            # OCR Extraction
-            raw_text = pytesseract.image_to_string(crop, config='--oem 3 --psm 6')
-            
-            # CLEANUP: Degree symbols and quotes often read as 'S', '8', or 'B'
-            # We strip them to let the Regex find the digits.
-            clean_text = raw_text.replace('°', ' ').replace("'", ' ').replace('"', ' ')
-            
-            # REGEX: Specifically looks for Deg, Min, Sec followed by N, S, E, or W
-            # This ignores the heading (272 W) because it lacks the full DMS structure
-            pattern = r"(\d+)\s+(\d+)\s+(\d+\.?\d*)\s*([NSEW])"
-            parts = re.findall(pattern, clean_text)
-
-            img.close()
-
-            if len(parts) >= 2:
-                lat = dms_to_decimal(parts[0][0], parts[0][1], parts[0][2], parts[0][3])
-                lon = dms_to_decimal(parts[1][0], parts[1][1], parts[1][2], parts[1][3])
+            # --- TARGETED CALIBRATION LOGIC ---
+            with Image.open(local_path) as img:
+                w, h = img.size
+                # Crop to Lower-Right Corner (Right 40%, Bottom 25%)
+                # This fixes the "Looking at lower-left" issue
+                crop_box = (int(w * 0.6), int(h * 0.75), w, h)
+                roi = img.crop(crop_box)
                 
-                # --- FLORIDA SAFETY FIX ---
-                # If OCR read 'S' instead of 'N', flip it back.
-                if lat < 0 and parts[0][3].upper() in ['N', 'S']:
-                    lat = abs(lat)
-
-                if lat and lon:
-                    # Injection via ExifTool
-                    cmd = ['exiftool', f'-GPSLatitude={lat}', f'-GPSLongitude={lon}', 
-                           '-GPSLatitudeRef=N', '-GPSLongitudeRef=W', '-overwrite_original', temp_path]
-                    subprocess.run(cmd, capture_output=True)
-                    
-                    map_data.append({"lat": lat, "lon": lon, "name": uploaded_file.name})
-                    processed_files.append((uploaded_file.name, open(temp_path, "rb").read()))
-                    log_entries.append(f"✅ {uploaded_file.name}: {lat}, {lon}")
-                else:
-                    log_entries.append(f"❌ {uploaded_file.name}: Math error on coordinates.")
+                # Optional: Pre-process ROI for better OCR (Grayscale)
+                roi = roi.convert('L') 
+                ocr_text = pytesseract.image_to_string(roi)
+            
+            coords = parse_coordinates(ocr_text)
+            
+            if coords:
+                lat, lat_ref, lon, lon_ref = coords
+                
+                # Build EXIF
+                gps_ifd = {
+                    piexif.GPSIFD.GPSLatitudeRef: lat_ref,
+                    piexif.GPSIFD.GPSLatitude: dd_to_exif_rational(lat),
+                    piexif.GPSIFD.GPSLongitudeRef: lon_ref,
+                    piexif.GPSIFD.GPSLongitude: dd_to_exif_rational(lon),
+                }
+                exif_dict = {"GPS": gps_ifd}
+                exif_bytes = piexif.dump(exif_dict)
+                
+                # Save with metadata
+                img = Image.open(local_path)
+                img.save(local_path, exif=exif_bytes)
+                print(f"✅ {local_name}: Injected {lat_ref}{lat}, {lon_ref}{lon}")
             else:
-                log_entries.append(f"❌ {uploaded_file.name}: Could not find two sets of DMS coordinates. OCR saw: {raw_text}")
+                print(f"⚠️ {local_name}: OCR text found ('{ocr_text.strip()}') but no coordinates parsed.")
 
-        except Exception as e:
-            log_entries.append(f"⚠️ Error: {str(e)}")
-        finally:
-            if os.path.exists(temp_path): os.remove(temp_path)
-
-    if map_data:
-        st.divider()
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.map(pd.DataFrame(map_data))
-        with col2:
-            st.subheader("Results")
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zf:
-                for fn, data in processed_files: zf.writestr(f"STAMPED_{fn}", data)
-            st.download_button("📥 DOWNLOAD ALL (ZIP)", zip_buffer.getvalue(), "stamped_photos.zip", use_container_width=True)
-            st.dataframe(pd.DataFrame(map_data), hide_index=True)
-
-    st.subheader("Status Log")
-    st.text_area("Log Output", value="\n".join(log_entries), height=200)
+if __name__ == "__main__":
+    process_photos(EXCEL_FILE)
