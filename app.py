@@ -1,18 +1,14 @@
 import streamlit as st
-import os
 import re
-import zipfile
 import io
-from PIL import Image
+from PIL import Image, ImageOps
 import pytesseract
 import piexif
 
-# --- STREAMLIT UI ---
-st.title("📍 Geotech Photo GPS Stamper")
-st.write("Upload your Excel workbook to extract photos and inject GPS metadata.")
+st.title("📸 Universal GPS Text-to-EXIF")
+st.write("Upload site photos with text overlays. The script will auto-rotate, read the GPS, and inject it into the file metadata.")
 
-# File Uploader replaces EXCEL_FILE variable
-uploaded_file = st.file_uploader("Choose an Excel workbook (.xlsx)", type="xlsx")
+uploaded_files = st.file_uploader("Upload Photos", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
 def dd_to_exif_rational(dd):
     dd = abs(dd)
@@ -24,69 +20,60 @@ def dd_to_exif_rational(dd):
 
 def parse_coordinates(text):
     text = text.replace('\n', ' ').strip()
+    # Matches N26.081078 W80.169002 (Decimal) or DMS formats
     dd_pattern = r'([NS])\s?(\d+\.\d+)\s+([EW])\s?(\d+\.\d+)'
     dms_pattern = r'(\d+)[°\s](\d+)[\'\s](\d+\.?\d*)[\"\s]([NS])\s+(\d+)[°\s](\d+)[\'\s](\d+\.?\d*)[\"\s]([EW])'
 
-    dd_match = re.search(dd_pattern, text)
-    if dd_match:
-        lat_ref, lat_val, lon_ref, lon_val = dd_match.groups()
+    match = re.search(dd_pattern, text)
+    if match:
+        lat_ref, lat_val, lon_ref, lon_val = match.groups()
         return float(lat_val), lat_ref, float(lon_val), lon_ref
 
-    dms_match = re.search(dms_pattern, text)
-    if dms_match:
-        la_d, la_m, la_s, la_ref, lo_d, lo_m, lo_s, lo_ref = dms_match.groups()
-        lat_dd = int(la_d) + int(la_m)/60 + float(la_s)/3600
-        lon_dd = int(lo_d) + int(lo_m)/60 + float(lo_s)/3600
-        return lat_dd, la_ref, lon_dd, lo_ref
+    match = re.search(dms_pattern, text)
+    if match:
+        la_d, la_m, la_s, la_ref, lo_d, lo_m, lo_s, lo_ref = match.groups()
+        return (int(la_d) + int(la_m)/60 + float(la_s)/3600), la_ref, \
+               (int(lo_d) + int(lo_m)/60 + float(lo_s)/3600), lo_ref
     return None
 
-if uploaded_file:
-    output_zip = io.BytesIO()
-    
-    with zipfile.ZipFile(output_zip, 'w') as new_zip:
-        # Open the uploaded Excel as a zip to extract media
-        with zipfile.ZipFile(uploaded_file, 'r') as archive:
-            image_files = [f for f in archive.namelist() if f.startswith('xl/media/')]
-            
-            if not image_files:
-                st.error("No images found in the uploaded workbook.")
-            
-            for img_name in image_files:
-                img_data = archive.read(img_name)
-                img_io = io.BytesIO(img_data)
-                
-                with Image.open(img_io) as img:
-                    # Fix Orientation and Crop for OCR
-                    w, h = img.size
-                    crop_box = (int(w * 0.6), int(h * 0.75), w, h)
-                    roi = img.crop(crop_box).convert('L')
-                    
-                    ocr_text = pytesseract.image_to_string(roi)
-                    coords = parse_coordinates(ocr_text)
-                    
-                    if coords:
-                        lat, lat_ref, lon, lon_ref = coords
-                        gps_ifd = {
-                            piexif.GPSIFD.GPSLatitudeRef: lat_ref,
-                            piexif.GPSIFD.GPSLatitude: dd_to_exif_rational(lat),
-                            piexif.GPSIFD.GPSLongitudeRef: lon_ref,
-                            piexif.GPSIFD.GPSLongitude: dd_to_exif_rational(lon),
-                        }
-                        exif_dict = {"GPS": gps_ifd}
-                        exif_bytes = piexif.dump(exif_dict)
-                        
-                        # Save processed image to memory
-                        img_byte_arr = io.BytesIO()
-                        img.save(img_byte_arr, format=img.format, exif=exif_bytes)
-                        new_zip.writestr(os.path.basename(img_name), img_byte_arr.getvalue())
-                        st.success(f"Processed: {os.path.basename(img_name)} ({lat_ref}{lat})")
-                    else:
-                        st.warning(f"Could not read coordinates on {os.path.basename(img_name)}")
-                        new_zip.writestr(os.path.basename(img_name), img_data)
+if uploaded_files:
+    for uploaded_file in uploaded_files:
+        img_bytes = uploaded_file.read()
+        img = Image.open(io.BytesIO(img_bytes))
 
-    st.download_button(
-        label="Download Processed Photos (ZIP)",
-        data=output_zip.getvalue(),
-        file_name="geotech_photos_with_gps.zip",
-        mime="application/zip"
-    )
+        # --- FIX ORIENTATION ---
+        # This handles the "Portrait vs Landscape" issue by applying the EXIF orientation tag
+        img = ImageOps.exif_transpose(img)
+        
+        w, h = img.size
+        # To be safe, we'll scan both bottom corners (Lower 25% of the image)
+        crop_box = (0, int(h * 0.75), w, h)
+        roi = img.crop(crop_box).convert('L')
+        
+        ocr_text = pytesseract.image_to_string(roi)
+        coords = parse_coordinates(ocr_text)
+
+        if coords:
+            lat, lat_ref, lon, lon_ref = coords
+            
+            # Prepare EXIF
+            gps_ifd = {
+                piexif.GPSIFD.GPSLatitudeRef: lat_ref,
+                piexif.GPSIFD.GPSLatitude: dd_to_exif_rational(lat),
+                piexif.GPSIFD.GPSLongitudeRef: lon_ref,
+                piexif.GPSIFD.GPSLongitude: dd_to_exif_rational(lon),
+            }
+            exif_dict = {"GPS": gps_ifd}
+            exif_bytes = piexif.dump(exif_dict)
+
+            # Save back to a downloadable buffer
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", exif=exif_bytes)
+            
+            st.success(f"✅ {uploaded_file.name}: Injected {lat_ref}{lat}, {lon_ref}{lon}")
+            st.download_button(f"Download {uploaded_file.name}", buf.getvalue(), file_name=f"gps_{uploaded_file.name}")
+        else:
+            st.error(f"❌ {uploaded_file.name}: Could not find coordinates in the bottom 25% of the image.")
+            with st.expander("See what the OCR saw"):
+                st.write(f"Raw Text: {ocr_text}")
+                st.image(roi, caption="This is the area being scanned")
