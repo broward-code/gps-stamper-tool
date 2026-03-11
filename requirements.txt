@@ -2,3 +2,4 @@ streamlit
 pytesseract
 pandas
 pillow
+piexif
