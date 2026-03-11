@@ -1,4 +1,4 @@
 tesseract-ocr
 libtesseract-dev
-piexif
 libimage-exiftool-perl
+
